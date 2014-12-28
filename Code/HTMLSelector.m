@@ -10,6 +10,7 @@
 typedef BOOL (^HTMLSelectorPredicate)(HTMLElement *node);
 typedef HTMLSelectorPredicate HTMLSelectorPredicateGen;
 
+static HTMLSelectorPredicate ScanSelectorPredicate(NSScanner *scanner, NSError **error);
 static HTMLSelectorPredicate SelectorFunctionForString(NSString *selectorString, NSError **error);
 
 static NSError * ParseError(NSString *reason, NSString *string, NSUInteger position)
@@ -65,6 +66,18 @@ HTMLSelectorPredicateGen bothCombinatorPredicate(HTMLSelectorPredicate a, HTMLSe
 	{
 		return a(node) && b(node);
 	};
+}
+
+HTMLSelectorPredicateGen eitherCombinatorPredicate(HTMLSelectorPredicate a, HTMLSelectorPredicate b)
+{
+    //There was probably an error somewhere else
+    //in parsing, so return nil here
+    if (!a && !b) return nil;
+    
+    return ^BOOL(HTMLElement *node)
+    {
+        return a(node) || b(node);
+    };
 }
 
 HTMLSelectorPredicateGen andCombinatorPredicate(NSArray *predicates)
@@ -316,6 +329,73 @@ HTMLSelectorPredicateGen isLastChildOfTypePredicate(HTMLSelectorPredicate typePr
 	return isNthChildOfTypePredicate(HTMLNthExpressionMake(0, 1), typePredicate, YES);
 }
 
+HTMLSelectorPredicateGen isContainsStringPredicate(NSString* str)
+{
+    return ^BOOL(HTMLElement *node) {
+        return [[node textContent] containsString:str];
+    };
+}
+
+//This is just to check if it has a child matching insideAfter predicate
+HTMLSelectorPredicateGen isAfterTagPredicate(HTMLSelectorPredicate insideAfter)
+{
+    return ^BOOL(HTMLElement *node) {
+        
+        for (HTMLElement *child in node.childElementNodes) {
+            if (insideAfter(child)) {
+                return YES;
+            }
+        }
+        return NO;
+    };
+}
+
+// This is just to check if there are two childres matching left and right predicate
+HTMLSelectorPredicateGen isBetweenTagPredicate(HTMLSelectorPredicate left, HTMLSelectorPredicate right)
+{
+    return ^BOOL(HTMLElement *node) {
+        BOOL leftRet = YES;
+        for (HTMLElement *child in node.childElementNodes) {
+            if(left(child)) {
+                leftRet = YES;
+                continue;
+            }
+            if(right(child) && leftRet) {
+                return YES;
+            }
+        }
+        return NO;
+    };
+}
+
+// For enumerate all child to see if anyone matches childPredicate
+HTMLSelectorPredicateGen hasPredicate(HTMLSelectorPredicate childPredicate)
+{
+    if (!childPredicate) return nil;
+    
+    return ^BOOL(HTMLElement *node) {
+        NSMutableArray *queue = [node.childElementNodes mutableCopy];
+        
+        while (queue.count > 0)
+        {
+            HTMLElement *curNode = [queue firstObject];
+            if(childPredicate(curNode))
+            {
+                return YES;
+            }
+            else
+            {
+                for (HTMLElement *child in curNode.childElementNodes) {
+                    [queue addObject:child];
+                }
+            }
+            [queue removeObjectAtIndex:0];
+        }
+        
+        return NO;
+    };
+}
+
 #pragma mark Attribute Helpers
 
 HTMLSelectorPredicateGen isKindOfClassPredicate(NSString *classname)
@@ -457,6 +537,20 @@ static NSString * scanFunctionInterior(NSScanner *scanner, NSError **error)
 		return nil;
 	}
     
+    //TODO: Handle nested brackets more robustly.
+    // Get the nested interior if there are nested brackets ..(..(..)..)..
+    // Count the number of ( between the first ( and the first ) and scan the same number of )
+    NSInteger times = [[interior componentsSeparatedByString:@"("] count]-1;
+    while (times > 0 && scanner.scanLocation)
+    {
+        [scanner scanString:@")" intoString:nil];
+        NSString *interior2 = nil;
+        [scanner scanUpToString:@")" intoString:&interior2];
+        interior = [interior stringByAppendingString:@")"];
+        interior = interior2 != nil ? [interior stringByAppendingString:interior2] : interior;
+        times--;
+    }
+    
     [scanner scanString:@")" intoString:nil];
 	return interior;
 }
@@ -541,11 +635,51 @@ static HTMLSelectorPredicateGen scanPredicateFromPseudoClass(NSScanner *scanner,
 			return isNthChildOfTypePredicate(nth, typePredicate, YES);
 		}
 	}
+    else if ([pseudo isEqualToString:@"contains"]){
+        NSString *interior = scanFunctionInterior(scanner, error);
+        
+        if (!interior) return nil;
+        NSString *str = [interior stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"'"]];
+        return isContainsStringPredicate(str);
+    }
 	else if ([pseudo isEqualToString:@"not"]) {
 		NSString *toNegateString = scanFunctionInterior(scanner, error);
 		HTMLSelectorPredicate toNegate = SelectorFunctionForString(toNegateString, error);
 		return negatePredicate(toNegate);
 	}
+    else if ([pseudo isEqualToString:@"has"]) {
+        NSString *interior = scanFunctionInterior(scanner, error);
+        if (!interior) return nil;
+        HTMLSelectorPredicate insideHas = SelectorFunctionForString(interior, error);
+        
+        return hasPredicate(insideHas);
+    }
+    else if ([pseudo isEqualToString:@"after"] || [pseudo isEqualToString:@"before"]) {
+        NSString *interior = scanFunctionInterior(scanner, error);
+        if (!interior) return nil;
+        HTMLSelectorPredicate insideAfter = SelectorFunctionForString(interior, error);
+        
+        return isAfterTagPredicate(insideAfter);
+    }
+    else if ([pseudo isEqualToString:@"between"]) {
+        NSString *interior = scanFunctionInterior(scanner, error);
+        if (!interior) return nil;
+        NSCharacterSet *whitespace = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+        NSArray *valueSplit = [[interior stringByTrimmingCharactersInSet:whitespace] componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@";"]];
+        
+        if (valueSplit.count != 2)
+        {
+            
+            NSLog(@"INFO: Number of strings after split by ';' is not 2 : %lu", (unsigned long)valueSplit.count);
+            return neverPredicate();
+        }
+        
+        HTMLSelectorPredicate left = SelectorFunctionForString(valueSplit[0] , error);
+        
+        HTMLSelectorPredicate right = SelectorFunctionForString(valueSplit[1] , error);
+        
+        return isBetweenTagPredicate(left, right);
+    }
 	
 	*error = ParseError(@"Unrecognized pseudo class", scanner.string, scanner.scanLocation);
 	return nil;
@@ -577,7 +711,7 @@ static NSCharacterSet *combinatorCharacters()
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         // Combinators are: whitespace, "greater-than sign" (U+003E, >), "plus sign" (U+002B, +) and "tilde" (U+007E, ~)
-        NSMutableCharacterSet *set = [NSMutableCharacterSet characterSetWithCharactersInString:@">+~"];
+        NSMutableCharacterSet *set = [NSMutableCharacterSet characterSetWithCharactersInString:@",>+~"];
         [set formUnionWithCharacterSet:HTMLSelectorWhitespaceCharacterSet()];
         frozenSet = [set copy];
     });
@@ -733,7 +867,9 @@ HTMLSelectorPredicateGen scanPredicate(NSScanner *scanner, HTMLSelectorPredicate
 		//Whitespace combinator
 		//y descendant of an x
 		return descendantOfPredicate(inputPredicate);
-	} else if ([combinator isEqualToString:@">"]) {
+    } else if ([combinator isEqualToString:@","]) {
+        return eitherCombinatorPredicate(inputPredicate, ScanSelectorPredicate(scanner, error));
+    } else if ([combinator isEqualToString:@">"]) {
 		return childOfOtherPredicatePredicate(inputPredicate);
 	} else if ([combinator isEqualToString:@"+"]) {
 		return adjacentSiblingPredicate(inputPredicate);
@@ -748,6 +884,20 @@ HTMLSelectorPredicateGen scanPredicate(NSScanner *scanner, HTMLSelectorPredicate
 		*error = ParseError(@"Unexpected combinator", scanner.string, scanner.scanLocation - combinator.length);
 		return nil;
 	}
+}
+
+static HTMLSelectorPredicate ScanSelectorPredicate(NSScanner *scanner, NSError **error)
+{
+    //Scan out predicate parts and combine them
+    HTMLSelectorPredicate lastPredicate = nil;
+    
+    do{
+        lastPredicate = scanPredicate(scanner, lastPredicate, error);
+    } while (lastPredicate && ![scanner isAtEnd] && !*error);
+    
+    NSCAssert(lastPredicate || *error, @"Need either a predicate or error at this point");
+    
+    return lastPredicate;
 }
 
 static HTMLSelectorPredicate SelectorFunctionForString(NSString *selectorString, NSError **error)
@@ -765,16 +915,7 @@ static HTMLSelectorPredicate SelectorFunctionForString(NSString *selectorString,
     scanner.caseSensitive = NO; //Section 3 states that in HTML parsing, selectors are case-insensitive
     scanner.charactersToBeSkipped = nil;
 	
-	//Scan out predicate parts and combine them
-	HTMLSelectorPredicate lastPredicate = nil;
-	
-	do{
-		lastPredicate = scanPredicate(scanner, lastPredicate, error);
-	} while (lastPredicate && ![scanner isAtEnd] && !*error);
-	
-	NSCAssert(lastPredicate || *error, @"Need either a predicate or error at this point");
-	
-	return lastPredicate;
+    return ScanSelectorPredicate(scanner, error);
 }
 
 @interface HTMLSelector ()
@@ -858,7 +999,82 @@ NSString * const HTMLSelectorLocationErrorKey = @"HTMLSelectorLocation";
     
     for (HTMLElement *node in self.treeEnumerator) {
         if ([node isKindOfClass:[HTMLElement class]] && [selector matchesElement:node]) {
+            //Return children before the predicate inside before(...)
+            if([selector.string containsString:@":before("]) {
+                NSString *interior = [self stringBetweenString:@":before(" andString:@")" withString:selector.string];
+                NSError *error;
+                HTMLSelectorPredicate predicate = SelectorFunctionForString(interior, &error);
+                HTMLElement *mutableNode = [node copy];
+                for (HTMLNode *mNode in node.children) {
+                    if ([mNode isKindOfClass:[HTMLElement class]] && predicate((HTMLElement *)mNode)) {
+                        break;
+                    }
+                    [mutableNode.mutableChildren addObject:mNode];
+                }
+                return mutableNode;
+            }
+            
+            //Return children after the predicate inside after(...)
+            if([selector.string containsString:@":after("]) {
+                NSString *interior = [self stringBetweenString:@":after(" andString:@")" withString:selector.string];
+                NSError *error;
+                HTMLSelectorPredicate predicate = SelectorFunctionForString(interior, &error);
+                HTMLElement *mutableNode = [node copy];
+                BOOL shouldAdd = NO;
+                for (HTMLNode *mNode in node.children) {
+                    if (shouldAdd) {
+                        [mutableNode.mutableChildren addObject:mNode];
+                        continue;
+                    }
+                    if ([mNode isKindOfClass:[HTMLElement class]] && predicate((HTMLElement *)mNode)) {
+                        shouldAdd = YES;
+                    }
+                }
+                return mutableNode;
+            }
+            
+            //Return children between the predicate inside between(...)
+            if([selector.string containsString:@":between("]) {
+                NSString *interior = [self stringBetweenString:@":between(" andString:@")" withString:selector.string];
+                NSError *error;
+                
+                NSCharacterSet *whitespace = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+                NSArray *valueSplit = [[interior stringByTrimmingCharactersInSet:whitespace] componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@";"]];
+                
+                HTMLSelectorPredicate left = SelectorFunctionForString(valueSplit[0] , &error);
+                HTMLSelectorPredicate right = SelectorFunctionForString(valueSplit[1] , &error);
+                HTMLElement *mutableNode = [node copy];
+                BOOL shouldAdd = NO;
+                for (HTMLNode *mNode in node.children) {
+                    if (shouldAdd && [mNode isKindOfClass:[HTMLElement class]] && right((HTMLElement *)mNode)) {
+                        break;
+                    }
+                    if (shouldAdd) {
+                        [mutableNode.mutableChildren addObject:mNode];
+                        continue;
+                    }
+                    if ([mNode isKindOfClass:[HTMLElement class]] && left((HTMLElement *)mNode)) {
+                        shouldAdd = YES;
+                    }
+                }
+                return mutableNode;
+            }
+            
             return node;
+        }
+    }
+    return nil;
+}
+
+-(NSString*)stringBetweenString:(NSString*)start andString:(NSString *)end withString:(NSString*)str
+{
+    NSScanner* scanner = [NSScanner scannerWithString:str];
+    [scanner setCharactersToBeSkipped:nil];
+    [scanner scanUpToString:start intoString:NULL];
+    if ([scanner scanString:start intoString:NULL]) {
+        NSString* result = nil;
+        if ([scanner scanUpToString:end intoString:&result]) {
+            return result;
         }
     }
     return nil;
