@@ -13,6 +13,17 @@ typedef HTMLSelectorPredicate HTMLSelectorPredicateGen;
 static HTMLSelectorPredicate ScanSelectorPredicate(NSScanner *scanner, NSError **error);
 static HTMLSelectorPredicate SelectorFunctionForString(NSString *selectorString, NSError **error);
 
+@interface NSString(IOS7Contains)
+-(BOOL) containsString: (NSString*)str;
+@end
+
+@implementation NSString(IOS7Contains)
+-(BOOL)containsString:(NSString *)str
+{
+    return [self rangeOfString:str].location != NSNotFound;
+}
+@end
+
 static NSError * ParseError(NSString *reason, NSString *string, NSUInteger position)
 {
     /*
